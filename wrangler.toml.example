@@ -1,0 +1,36 @@
+name = "test-dexgram-vault-api"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "test-dexgram-vault-db"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[vars]
+TOKEN_TTL_SECONDS = "86400"
+URL_TTL_SECONDS = "300"
+MAX_UPLOAD_BYTES = "5368709120"
+RATE_LIMIT_MAX_REQUESTS = "60"
+RATE_LIMIT_WINDOW_MS = "60000"
+# Bucket credentials, INTERNALAPI_SECRET, BACKUP_* secrets, and SESSION_SECRET
+# should be set with `wrangler secret put` or GitHub Actions secrets.
+
+[env.test]
+name = "test-dexgram-vaultdb-api"
+workers_dev = false
+routes = [
+  { pattern = "test-vaultdb.dexgram.app/*", zone_name = "dexgram.app" }
+]
+
+[[env.test.d1_databases]]
+binding = "DB"
+database_name = "test-dexgram-vault-db"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[env.test.vars]
+TOKEN_TTL_SECONDS = "86400"
+URL_TTL_SECONDS = "300"
+MAX_UPLOAD_BYTES = "5368709120"
+RATE_LIMIT_MAX_REQUESTS = "60"
+RATE_LIMIT_WINDOW_MS = "60000"

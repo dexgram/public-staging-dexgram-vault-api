@@ -1,0 +1,1136 @@
+import { parseClientCode } from "./utils/clientCode";
+import { hitRateLimit } from "./utils/rateLimit";
+import { presignUrl, type BucketConfig } from "./utils/s3";
+import { signSessionToken, verifySessionToken } from "./utils/token";
+
+interface Env {
+  [key: string]: unknown;
+  DB: D1Database;
+  SESSION_SECRET: string;
+  TOKEN_TTL_SECONDS?: string;
+  URL_TTL_SECONDS?: string;
+  MAX_UPLOAD_BYTES?: string;
+  RATE_LIMIT_WINDOW_MS?: string;
+  RATE_LIMIT_MAX_REQUESTS?: string;
+  INTERNALAPI?: string;
+  INTERNALAPI_SECRET?: string;
+  BUCKET_MAIN?: string;
+  bucket_main?: string;
+  BACKUP_READ_SECRET?: string;
+  backup_read_secret?: string;
+  BACKUP_DELETE_SECRET?: string;
+  backup_delete_secret?: string;
+  PROTECTED_DELETE_BUCKET_SLOTS?: string;
+  protected_delete_bucket_slots?: string;
+}
+
+interface UserRow {
+  client_code: string;
+  bucket_id: string;
+  quota_gb: number;
+  used_bytes: number;
+  uploads_count: number;
+  downloads_count: number;
+  subscription_expires_at: string;
+  last_activity_at: string | null;
+}
+
+interface FileRow {
+  file_id: string;
+  client_code: string;
+  object_key: string;
+  size_bytes: number | null;
+  mime_type: string | null;
+  status: string;
+  deleted_at: string | null;
+  created_at: string;
+}
+
+interface SizeAggregateRow {
+  total_size_bytes: number | null;
+  active_files_count: number | null;
+}
+
+const GB = 1024 * 1024 * 1024;
+
+interface InternalAdminUser {
+  accountId?: string;
+  status?: string;
+  subscription?: {
+    status?: string;
+    activePaid?: boolean;
+    expiresAtIso?: string;
+    expiresAt?: number;
+  };
+  devices?: { limits?: { vaultQuotaMb?: number } };
+}
+
+const json = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+
+const badRequest = (message: string, status = 400) =>
+  json({ error: message }, status);
+
+function readBucketSlotsFromEnv(env: Env): Record<string, BucketConfig> {
+  const buckets: Record<string, BucketConfig> = {};
+  const maxBucketSlots = 20;
+
+  for (let index = 1; index <= maxBucketSlots; index += 1) {
+    const slot = String(index);
+    const id = String(env[`BUCKET_ID_${index}`] ?? "").trim();
+    if (!id) continue;
+
+    const bucketName = String(env[`BUCKET_NAME_${index}`] ?? "").trim();
+    const endpoint = String(env[`BUCKET_ENDPOINT_${index}`] ?? "").trim();
+    const region = String(env[`BUCKET_REGION_${index}`] ?? "").trim();
+    const accessKey = String(env[`BUCKET_ACCESS_KEY_${index}`] ?? "").trim();
+    const secretKey = String(env[`BUCKET_SECRET_KEY_${index}`] ?? "").trim();
+
+    if (!bucketName || !endpoint || !region || !accessKey || !secretKey) {
+      throw new Error(`Incomplete bucket config at index ${index}`);
+    }
+
+    buckets[slot] = {
+      id,
+      bucketName,
+      endpoint,
+      region,
+      accessKey,
+      secretKey,
+    };
+  }
+
+  if (Object.keys(buckets).length === 0) {
+    throw new Error("No bucket config found in indexed bucket secrets");
+  }
+
+  return buckets;
+}
+
+function getMainBucketSlot(env: Env): string {
+  const slot = String(env.BUCKET_MAIN ?? env.bucket_main ?? "").trim();
+  if (!slot) {
+    throw new Error("Missing BUCKET_MAIN");
+  }
+  if (!/^\d+$/.test(slot)) {
+    throw new Error("BUCKET_MAIN must be a numeric bucket slot");
+  }
+  return slot;
+}
+
+function getProtectedDeleteBucketSlots(env: Env): Set<string> {
+  const raw = String(
+    env.PROTECTED_DELETE_BUCKET_SLOTS ??
+      env.protected_delete_bucket_slots ??
+      "",
+  ).trim();
+
+  if (!raw) return new Set();
+
+  return new Set(
+    raw
+      .split(",")
+      .map((slot) => slot.trim())
+      .filter((slot) => /^\d+$/.test(slot)),
+  );
+}
+
+function isProtectedDeleteBucketSlot(env: Env, slot: string): boolean {
+  return getProtectedDeleteBucketSlots(env).has(slot);
+}
+
+function serializeError(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    };
+  }
+
+  return { value: String(error) };
+}
+
+async function getUser(
+  db: D1Database,
+  clientCode: string,
+): Promise<UserRow | null> {
+  const result = await db
+    .prepare("SELECT * FROM users WHERE client_code = ?")
+    .bind(clientCode)
+    .first<UserRow>();
+  return result ?? null;
+}
+
+async function getAuthClientCode(
+  request: Request,
+  env: Env,
+): Promise<string | null> {
+  const header = request.headers.get("authorization") || "";
+  const [, token] = header.split(" ");
+  if (!token) return null;
+  const payload = await verifySessionToken(token, env.SESSION_SECRET);
+  return payload?.clientCode ?? null;
+}
+
+function isSubscriptionActive(iso: string): boolean {
+  return Date.now() < new Date(iso).getTime();
+}
+
+async function findInternalUserByAccountId(
+  env: Env,
+  accountId: string,
+): Promise<InternalAdminUser | null> {
+  const baseUrl = String(env.INTERNALAPI ?? "").trim().replace(/\/$/, "");
+  const secret = String(env.INTERNALAPI_SECRET ?? "").trim();
+  if (!baseUrl || !secret) {
+    throw new Error("Missing INTERNALAPI or INTERNALAPI_SECRET");
+  }
+
+  let offset = 0;
+  const limit = 500;
+
+  while (true) {
+    const response = await fetch(
+      `${baseUrl}/v1/admin/users?limit=${limit}&offset=${offset}`,
+      {
+        headers: {
+          "x-admin-secret": secret,
+          accept: "application/json",
+        },
+      },
+    );
+
+    if (!response.ok) {
+      throw new Error(`internalapi admin users failed: ${response.status}`);
+    }
+
+    const payload = (await response.json()) as {
+      users?: InternalAdminUser[];
+      pagination?: { hasMore?: boolean; nextOffset?: number };
+    };
+
+    const found = payload.users?.find((u) => u.accountId === accountId);
+    if (found) return found;
+
+    if (!payload.pagination?.hasMore || payload.pagination.nextOffset == null) {
+      return null;
+    }
+
+    offset = payload.pagination.nextOffset;
+  }
+}
+
+async function syncUserFromInternalApi(
+  env: Env,
+  clientCode: string,
+): Promise<UserRow | null> {
+  const internalUser = await findInternalUserByAccountId(env, clientCode);
+  if (!internalUser) return null;
+
+  const quotaMb = Number(internalUser.devices?.limits?.vaultQuotaMb ?? 0);
+  const quotaGb = Math.max(0, Math.floor(quotaMb / 1024));
+  const expiresAtIso =
+    internalUser.subscription?.expiresAtIso ??
+    (internalUser.subscription?.expiresAt
+      ? new Date(internalUser.subscription.expiresAt * 1000).toISOString()
+      : new Date(0).toISOString());
+
+  const defaultBucketSlot = getMainBucketSlot(env);
+  const defaultBucketId = String(env[`BUCKET_ID_${defaultBucketSlot}`] ?? "").trim();
+  if (!defaultBucketId) {
+    throw new Error(`Missing BUCKET_ID_${defaultBucketSlot} for user provisioning`);
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO users (client_code, bucket_id, quota_gb, subscription_expires_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(client_code) DO UPDATE SET
+       quota_gb = excluded.quota_gb,
+       subscription_expires_at = excluded.subscription_expires_at`,
+  )
+    .bind(clientCode, defaultBucketId, quotaGb, expiresAtIso)
+    .run();
+
+  return getUser(env.DB, clientCode);
+}
+
+function createStorageObjectKey(): string {
+  const storageId = crypto.randomUUID();
+  return `objects/${storageId.slice(0, 2)}/${storageId}`;
+}
+
+async function verifyObjectAndReadHeaders(
+  url: string,
+): Promise<{ sizeBytes: number; contentType: string | null; etag: string | null }> {
+  const response = await fetch(url, { method: "HEAD" });
+  if (!response.ok) {
+    throw new Error(`Unable to verify upload: ${response.status}`);
+  }
+  const size = Number(response.headers.get("content-length") || 0);
+  return {
+    sizeBytes: size,
+    contentType: response.headers.get("content-type"),
+    etag: response.headers.get("etag"),
+  };
+}
+
+function isAuthorizedSecret(request: Request, expected: string): boolean {
+  const provided = String(
+    request.headers.get("x-backup-secret") ??
+      request.headers.get("x-admin-secret") ??
+      "",
+  ).trim();
+
+  return Boolean(expected && provided && provided === expected);
+}
+
+function isBackupReadAuthorized(request: Request, env: Env): boolean {
+  const expected = String(
+    env.BACKUP_READ_SECRET ?? env.backup_read_secret ?? "",
+  ).trim();
+  return isAuthorizedSecret(request, expected);
+}
+
+function isBackupDeleteAuthorized(request: Request, env: Env): boolean {
+  const expected = String(
+    env.BACKUP_DELETE_SECRET ?? env.backup_delete_secret ?? "",
+  ).trim();
+  return isAuthorizedSecret(request, expected);
+}
+
+function usagePayload(user: UserRow) {
+  return {
+    quotaGb: user.quota_gb,
+    usedBytes: user.used_bytes,
+    uploadsCount: user.uploads_count,
+    downloadsCount: user.downloads_count,
+    expiresAt: user.subscription_expires_at,
+  };
+}
+
+function validateBucketConfig(bucket: BucketConfig): string | null {
+  if (!bucket.endpoint) return "bucket endpoint is missing";
+  if (!bucket.bucketName) return "bucket name is missing";
+  if (!bucket.region) return "bucket region is missing";
+  if (!bucket.accessKey) return "bucket access key is missing";
+  if (!bucket.secretKey) return "bucket secret key is missing";
+
+  try {
+    new URL(normalizeBucketEndpoint(bucket.endpoint));
+  } catch {
+    return "bucket endpoint is not a valid URL";
+  }
+
+  return null;
+}
+
+function normalizeBucketEndpoint(endpoint: string): string {
+  const trimmed = endpoint.trim();
+  const unquoted = trimmed.replace(/^(["'])(.*)\1$/, "$2").trim();
+
+  if (/^[a-z][a-z\d+.-]*:\/\//i.test(unquoted)) {
+    return unquoted;
+  }
+
+  if (unquoted.startsWith("//")) {
+    return `https:${unquoted}`;
+  }
+
+  return `https://${unquoted}`;
+}
+
+export default {
+  async fetch(request, env, ctx): Promise<Response> {
+    const requestId = crypto.randomUUID();
+    const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
+    const url = new URL(request.url);
+
+    try {
+      const limit = Number(env.RATE_LIMIT_MAX_REQUESTS ?? 60);
+      const windowMs = Number(env.RATE_LIMIT_WINDOW_MS ?? 60_000);
+
+      if (hitRateLimit(ip, limit, windowMs)) {
+        return badRequest("Too many requests", 429);
+      }
+
+      if (!env.SESSION_SECRET) {
+        console.error("[vault-api] missing SESSION_SECRET", {
+          requestId,
+          path: url.pathname,
+        });
+        return badRequest("Server misconfigured", 500);
+      }
+
+      if (request.method === "POST" && url.pathname === "/auth/login") {
+        const body = (await request.json().catch(() => null)) as {
+          clientCode?: string;
+        } | null;
+        if (!body?.clientCode) return badRequest("clientCode is required");
+
+        const clientCode = parseClientCode(body.clientCode);
+        if (!clientCode) return badRequest("Invalid client code format");
+
+        const user = await syncUserFromInternalApi(env, clientCode);
+        if (!user) return badRequest("Unknown client code", 404);
+
+        const now = Math.floor(Date.now() / 1000);
+        const expiresInSeconds = Number(env.TOKEN_TTL_SECONDS ?? 86_400);
+        const token = await signSessionToken(
+          {
+            clientCode,
+            iat: now,
+            exp: now + expiresInSeconds,
+          },
+          env.SESSION_SECRET,
+        );
+
+        return json({
+          token,
+          expiresInSeconds,
+          ...usagePayload(user),
+          subscriptionActive: isSubscriptionActive(
+            user.subscription_expires_at,
+          ),
+        });
+      }
+
+      let bucketSlots: Record<string, BucketConfig>;
+      let mainBucketSlot: string;
+      try {
+        bucketSlots = readBucketSlotsFromEnv(env);
+        mainBucketSlot = getMainBucketSlot(env);
+      } catch (error) {
+        console.error("[vault-api] invalid indexed bucket secrets", {
+          requestId,
+          path: url.pathname,
+          error: serializeError(error),
+        });
+        return badRequest("Server misconfigured: invalid bucket config", 500);
+      }
+
+      const mainBucket = bucketSlots[mainBucketSlot];
+      if (!mainBucket) {
+        return badRequest(`BUCKET_MAIN slot ${mainBucketSlot} is not configured`, 500);
+      }
+
+      const normalizedBucket: BucketConfig = {
+        ...mainBucket,
+        endpoint: normalizeBucketEndpoint(mainBucket.endpoint),
+      };
+
+      const bucketConfigError = validateBucketConfig(normalizedBucket);
+      if (bucketConfigError) {
+        console.error("[vault-api] invalid main bucket config", {
+          requestId,
+          path: url.pathname,
+          bucketSlot: mainBucketSlot,
+          bucketId: normalizedBucket.id,
+          message: bucketConfigError,
+          endpointPreview: String(normalizedBucket.endpoint ?? "").slice(0, 200),
+        });
+        return badRequest("Server misconfigured: invalid main bucket config", 500);
+      }
+
+      if (request.method === "GET" && url.pathname === "/admin/backup/plan") {
+        if (!isBackupReadAuthorized(request, env)) {
+          return badRequest("Unauthorized", 401);
+        }
+
+        const fromSlot = String(url.searchParams.get("from") ?? mainBucketSlot).trim();
+        const toSlot = String(
+          url.searchParams.get("to") ?? (fromSlot === "1" ? "2" : "1"),
+        ).trim();
+        if (!/^\d+$/.test(fromSlot) || !/^\d+$/.test(toSlot)) {
+          return badRequest("from and to must be numeric bucket slots");
+        }
+        if (fromSlot === toSlot) {
+          return badRequest("from and to must be different bucket slots");
+        }
+
+        const sourceBucket = bucketSlots[fromSlot];
+        const destinationBucket = bucketSlots[toSlot];
+        if (!sourceBucket) return badRequest(`Source bucket slot ${fromSlot} is not configured`, 500);
+        if (!destinationBucket)
+          return badRequest(`Destination bucket slot ${toSlot} is not configured`, 500);
+
+        const normalizedSourceBucket: BucketConfig = {
+          ...sourceBucket,
+          endpoint: normalizeBucketEndpoint(sourceBucket.endpoint),
+        };
+        const normalizedDestinationBucket: BucketConfig = {
+          ...destinationBucket,
+          endpoint: normalizeBucketEndpoint(destinationBucket.endpoint),
+        };
+
+        const sourceError = validateBucketConfig(normalizedSourceBucket);
+        const destinationError = validateBucketConfig(normalizedDestinationBucket);
+        if (sourceError || destinationError) {
+          return badRequest("Server misconfigured: invalid backup bucket config", 500);
+        }
+
+        const limit = Math.min(
+          Math.max(Number(url.searchParams.get("limit") ?? 100), 1),
+          500,
+        );
+        const offset = Math.max(Number(url.searchParams.get("offset") ?? 0), 0);
+        const ttl = Math.min(
+          Math.max(Number(url.searchParams.get("ttl") ?? 900), 60),
+          3600,
+        );
+
+        const rows = await env.DB.prepare(
+          `SELECT f.file_id, f.object_key, f.size_bytes, f.mime_type, f.created_at
+           FROM files f
+           LEFT JOIN file_replicas r
+             ON r.file_id = f.file_id
+            AND r.bucket_slot = ?
+            AND r.status = 'verified'
+            AND r.size_bytes = f.size_bytes
+           WHERE f.deleted_at IS NULL
+             AND f.status = 'active'
+             AND f.size_bytes IS NOT NULL
+             AND r.file_id IS NULL
+           ORDER BY f.created_at ASC
+           LIMIT ? OFFSET ?`,
+        )
+          .bind(toSlot, limit, offset)
+          .all<FileRow>();
+
+        const files = await Promise.all(
+          (rows.results ?? []).map(async (file) => {
+            const contentType = file.mime_type || "application/octet-stream";
+            const contentLength = String(file.size_bytes ?? 0);
+            const downloadUrl = await presignUrl({
+              method: "GET",
+              bucket: normalizedSourceBucket,
+              objectKey: file.object_key,
+              expiresInSeconds: ttl,
+            });
+            const uploadUrl = await presignUrl({
+              method: "PUT",
+              bucket: normalizedDestinationBucket,
+              objectKey: file.object_key,
+              expiresInSeconds: ttl,
+              headers: {
+                "content-type": contentType,
+                "content-length": contentLength,
+              },
+            });
+
+            return {
+              fileId: file.file_id,
+              objectKey: file.object_key,
+              sizeBytes: file.size_bytes,
+              mimeType: contentType,
+              createdAt: file.created_at,
+              downloadUrl,
+              uploadUrl,
+              requiredHeaders: {
+                "content-type": contentType,
+                "content-length": contentLength,
+              },
+            };
+          }),
+        );
+
+        return json({
+          activeSlot: mainBucketSlot,
+          fromSlot,
+          toSlot,
+          limit,
+          offset,
+          nextOffset: files.length === limit ? offset + limit : null,
+          expiresAt: new Date(Date.now() + ttl * 1000).toISOString(),
+          files,
+        });
+      }
+
+      if (request.method === "POST" && url.pathname === "/admin/backup/mark-copied") {
+        if (!isBackupReadAuthorized(request, env)) {
+          return badRequest("Unauthorized", 401);
+        }
+
+        const body = (await request.json().catch(() => null)) as {
+          fileId?: string;
+          toSlot?: string;
+        } | null;
+        const fileId = String(body?.fileId ?? "").trim();
+        const toSlot = String(body?.toSlot ?? "").trim();
+        if (!fileId || !/^\d+$/.test(toSlot)) {
+          return badRequest("fileId and numeric toSlot are required");
+        }
+
+        const destinationBucket = bucketSlots[toSlot];
+        if (!destinationBucket)
+          return badRequest(`Destination bucket slot ${toSlot} is not configured`, 500);
+
+        const file = await env.DB.prepare(
+          "SELECT * FROM files WHERE file_id = ? AND deleted_at IS NULL AND status = 'active'",
+        )
+          .bind(fileId)
+          .first<FileRow>();
+        if (!file) return badRequest("File not found", 404);
+
+        const normalizedDestinationBucket: BucketConfig = {
+          ...destinationBucket,
+          endpoint: normalizeBucketEndpoint(destinationBucket.endpoint),
+        };
+        const destinationError = validateBucketConfig(normalizedDestinationBucket);
+        if (destinationError) {
+          return badRequest("Server misconfigured: invalid backup bucket config", 500);
+        }
+
+        const headUrl = await presignUrl({
+          method: "HEAD",
+          bucket: normalizedDestinationBucket,
+          objectKey: file.object_key,
+          expiresInSeconds: 120,
+        });
+        const objectState = await verifyObjectAndReadHeaders(headUrl);
+        const expectedSize = file.size_bytes ?? 0;
+        if (objectState.sizeBytes !== expectedSize) {
+          return badRequest("Replica size mismatch", 409);
+        }
+
+        const nowIso = new Date().toISOString();
+        await env.DB.prepare(
+          `INSERT INTO file_replicas
+             (file_id, bucket_slot, object_key, size_bytes, etag, status, replicated_at, verified_at, last_error)
+           VALUES (?, ?, ?, ?, ?, 'verified', ?, ?, NULL)
+           ON CONFLICT(file_id, bucket_slot) DO UPDATE SET
+             object_key = excluded.object_key,
+             size_bytes = excluded.size_bytes,
+             etag = excluded.etag,
+             status = 'verified',
+             replicated_at = excluded.replicated_at,
+             verified_at = excluded.verified_at,
+             last_error = NULL`,
+        )
+          .bind(
+            file.file_id,
+            toSlot,
+            file.object_key,
+            expectedSize,
+            objectState.etag,
+            nowIso,
+            nowIso,
+          )
+          .run();
+
+        return json({
+          fileId: file.file_id,
+          bucketSlot: toSlot,
+          objectKey: file.object_key,
+          sizeBytes: expectedSize,
+          etag: objectState.etag,
+          status: "verified",
+          verifiedAt: nowIso,
+        });
+      }
+
+      if (request.method === "GET" && url.pathname === "/admin/backup/delete-plan") {
+        if (!isBackupDeleteAuthorized(request, env)) {
+          return badRequest("Unauthorized", 401);
+        }
+
+        const fromSlot = String(url.searchParams.get("from") ?? mainBucketSlot).trim();
+        const toSlot = String(
+          url.searchParams.get("to") ?? (fromSlot === "1" ? "2" : "1"),
+        ).trim();
+        if (!/^\d+$/.test(fromSlot) || !/^\d+$/.test(toSlot)) {
+          return badRequest("from and to must be numeric bucket slots");
+        }
+        if (fromSlot === toSlot) {
+          return badRequest("from and to must be different bucket slots");
+        }
+        if (isProtectedDeleteBucketSlot(env, toSlot)) {
+          return badRequest("Admin delete is disabled for protected bucket slot", 403);
+        }
+
+        const destinationBucket = bucketSlots[toSlot];
+        if (!destinationBucket)
+          return badRequest(`Destination bucket slot ${toSlot} is not configured`, 500);
+
+        const normalizedDestinationBucket: BucketConfig = {
+          ...destinationBucket,
+          endpoint: normalizeBucketEndpoint(destinationBucket.endpoint),
+        };
+        const destinationError = validateBucketConfig(normalizedDestinationBucket);
+        if (destinationError) {
+          return badRequest("Server misconfigured: invalid backup bucket config", 500);
+        }
+
+        const olderThanHours = Math.max(
+          Number(url.searchParams.get("olderThanHours") ?? 72),
+          1,
+        );
+        const cutoffIso = new Date(
+          Date.now() - olderThanHours * 60 * 60 * 1000,
+        ).toISOString();
+        const limit = Math.min(
+          Math.max(Number(url.searchParams.get("limit") ?? 100), 1),
+          500,
+        );
+        const offset = Math.max(Number(url.searchParams.get("offset") ?? 0), 0);
+        const ttl = Math.min(
+          Math.max(Number(url.searchParams.get("ttl") ?? 900), 60),
+          3600,
+        );
+
+        const rows = await env.DB.prepare(
+          `SELECT file_id, object_key, size_bytes, mime_type, created_at, deleted_at
+           FROM files
+           WHERE deleted_at IS NOT NULL AND deleted_at <= ?
+           ORDER BY deleted_at ASC
+           LIMIT ? OFFSET ?`,
+        )
+          .bind(cutoffIso, limit, offset)
+          .all<FileRow>();
+
+        const files = await Promise.all(
+          (rows.results ?? []).map(async (file) => {
+            const deleteUrl = await presignUrl({
+              method: "DELETE",
+              bucket: normalizedDestinationBucket,
+              objectKey: file.object_key,
+              expiresInSeconds: ttl,
+            });
+
+            return {
+              fileId: file.file_id,
+              objectKey: file.object_key,
+              sizeBytes: file.size_bytes,
+              deletedAt: file.deleted_at,
+              deleteUrl,
+            };
+          }),
+        );
+
+        return json({
+          activeSlot: mainBucketSlot,
+          fromSlot,
+          toSlot,
+          olderThanHours,
+          cutoffIso,
+          limit,
+          offset,
+          nextOffset: files.length === limit ? offset + limit : null,
+          expiresAt: new Date(Date.now() + ttl * 1000).toISOString(),
+          files,
+        });
+      }
+
+      if (request.method === "POST" && url.pathname === "/admin/backup/mark-deleted") {
+        if (!isBackupDeleteAuthorized(request, env)) {
+          return badRequest("Unauthorized", 401);
+        }
+
+        const body = (await request.json().catch(() => null)) as {
+          fileId?: string;
+          toSlot?: string;
+        } | null;
+        const fileId = String(body?.fileId ?? "").trim();
+        const toSlot = String(body?.toSlot ?? "").trim();
+        if (!fileId || !/^\d+$/.test(toSlot)) {
+          return badRequest("fileId and numeric toSlot are required");
+        }
+        if (isProtectedDeleteBucketSlot(env, toSlot)) {
+          return badRequest("Admin delete is disabled for protected bucket slot", 403);
+        }
+
+        const nowIso = new Date().toISOString();
+        await env.DB.prepare(
+          `UPDATE file_replicas
+           SET status = 'deleted',
+               verified_at = ?,
+               last_error = NULL
+           WHERE file_id = ? AND bucket_slot = ?`,
+        )
+          .bind(nowIso, fileId, toSlot)
+          .run();
+
+        return json({
+          fileId,
+          bucketSlot: toSlot,
+          status: "deleted",
+          verifiedAt: nowIso,
+        });
+      }
+
+      const clientCode = await getAuthClientCode(request, env);
+      if (!clientCode) {
+        return badRequest("Unauthorized", 401);
+      }
+
+      const user = await syncUserFromInternalApi(env, clientCode);
+      if (!user) {
+        return badRequest("Unauthorized", 401);
+      }
+
+      if (request.method === "POST" && url.pathname === "/uploads/request") {
+        const body = (await request.json().catch(() => null)) as {
+          mimeType?: string;
+          sizeBytes?: number;
+        } | null;
+        if (!body?.mimeType || !Number.isFinite(body.sizeBytes)) {
+          return badRequest("mimeType and sizeBytes are required");
+        }
+
+        const sizeBytes = Number(body.sizeBytes);
+        if (sizeBytes <= 0) return badRequest("sizeBytes must be positive");
+
+        const maxUploadBytes = Number(
+          env.MAX_UPLOAD_BYTES ?? 5 * 1024 * 1024 * 1024,
+        );
+        if (sizeBytes > maxUploadBytes)
+          return badRequest("File too large for plan", 403);
+
+        if (!isSubscriptionActive(user.subscription_expires_at)) {
+          return badRequest("Subscription expired", 403);
+        }
+
+        const maxBytes = user.quota_gb * GB;
+        if (user.used_bytes + sizeBytes > maxBytes) {
+          return badRequest("Quota exceeded", 403);
+        }
+
+        const fileId = crypto.randomUUID();
+        const objectKey = createStorageObjectKey();
+        const nowIso = new Date().toISOString();
+
+        await env.DB.prepare(
+          `INSERT INTO files (file_id, client_code, object_key, size_bytes, mime_type, status, created_at)
+           VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+        )
+          .bind(fileId, clientCode, objectKey, sizeBytes, body.mimeType, nowIso)
+          .run();
+
+        const ttl = Number(env.URL_TTL_SECONDS ?? 300);
+        const uploadUrl = await presignUrl({
+          method: "PUT",
+          bucket: normalizedBucket,
+          objectKey,
+          expiresInSeconds: ttl,
+          headers: {
+            "content-type": body.mimeType,
+            "content-length": String(sizeBytes),
+          },
+        });
+
+        return json({
+          fileId,
+          objectKey,
+          uploadUrl,
+          expiresAt: new Date(Date.now() + ttl * 1000).toISOString(),
+          requiredHeaders: {
+            "content-type": body.mimeType,
+            "content-length": String(sizeBytes),
+          },
+        });
+      }
+
+      if (request.method === "POST" && url.pathname === "/uploads/complete") {
+        const body = (await request.json().catch(() => null)) as {
+          fileId?: string;
+        } | null;
+        if (!body?.fileId) return badRequest("fileId is required");
+
+        const file = await env.DB.prepare(
+          "SELECT * FROM files WHERE file_id = ? AND client_code = ? AND deleted_at IS NULL",
+        )
+          .bind(body.fileId, clientCode)
+          .first<FileRow>();
+        if (!file) return badRequest("File not found", 404);
+
+        if (file.status === "active") {
+          const refreshed = await getUser(env.DB, clientCode);
+          return json({
+            fileId: file.file_id,
+            status: "active",
+            ...usagePayload(refreshed ?? user),
+          });
+        }
+
+        const headUrl = await presignUrl({
+          method: "HEAD",
+          bucket: normalizedBucket,
+          objectKey: file.object_key,
+          expiresInSeconds: 120,
+        });
+
+        const objectState = await verifyObjectAndReadHeaders(headUrl);
+        const nowIso = new Date().toISOString();
+
+        await env.DB.batch([
+          env.DB.prepare(
+            "UPDATE files SET size_bytes = ?, mime_type = COALESCE(?, mime_type), status = 'active' WHERE file_id = ?",
+          ).bind(objectState.sizeBytes, objectState.contentType, file.file_id),
+          env.DB.prepare(
+            `UPDATE users
+             SET used_bytes = used_bytes + ?,
+                 uploads_count = uploads_count + 1,
+                 last_activity_at = ?
+             WHERE client_code = ?`,
+          ).bind(objectState.sizeBytes, nowIso, clientCode),
+        ]);
+
+        const refreshed = await getUser(env.DB, clientCode);
+        return json({
+          fileId: file.file_id,
+          sizeBytes: objectState.sizeBytes,
+          ...usagePayload(refreshed ?? user),
+        });
+      }
+
+      if (request.method === "GET" && url.pathname === "/files") {
+        const rows = await env.DB.prepare(
+          `SELECT file_id, object_key, size_bytes, mime_type, created_at
+           FROM files
+           WHERE client_code = ? AND deleted_at IS NULL AND status = 'active'
+           ORDER BY created_at DESC`,
+        )
+          .bind(clientCode)
+          .all();
+
+        return json({ files: rows.results ?? [] });
+      }
+
+      if (request.method === "GET" && url.pathname === "/usage") {
+        const aggregate = await env.DB.prepare(
+          `SELECT
+             COALESCE(SUM(size_bytes), 0) AS total_size_bytes,
+             COUNT(*) AS active_files_count
+           FROM files
+           WHERE client_code = ? AND deleted_at IS NULL AND status = 'active'`,
+        )
+          .bind(clientCode)
+          .first<SizeAggregateRow>();
+
+        return json({
+          clientCode,
+          ...usagePayload(user),
+          activeFilesCount: Number(aggregate?.active_files_count ?? 0),
+          actualActiveBytes: Number(aggregate?.total_size_bytes ?? 0),
+        });
+      }
+
+      const replaceRequestMatch = url.pathname.match(
+        /^\/files\/([^/]+)\/replace\/request$/,
+      );
+      if (request.method === "POST" && replaceRequestMatch) {
+        const fileId = replaceRequestMatch[1];
+        const body = (await request.json().catch(() => null)) as {
+          mimeType?: string;
+          sizeBytes?: number;
+        } | null;
+
+        if (!body?.mimeType || !Number.isFinite(body.sizeBytes)) {
+          return badRequest("mimeType and sizeBytes are required");
+        }
+
+        const newSizeBytes = Number(body.sizeBytes);
+        if (newSizeBytes <= 0) return badRequest("sizeBytes must be positive");
+
+        const file = await env.DB.prepare(
+          "SELECT * FROM files WHERE file_id = ? AND client_code = ? AND deleted_at IS NULL AND status = 'active'",
+        )
+          .bind(fileId, clientCode)
+          .first<FileRow>();
+        if (!file) return badRequest("File not found", 404);
+
+        if (!isSubscriptionActive(user.subscription_expires_at)) {
+          return badRequest("Subscription expired", 403);
+        }
+
+        const maxUploadBytes = Number(
+          env.MAX_UPLOAD_BYTES ?? 5 * 1024 * 1024 * 1024,
+        );
+        if (newSizeBytes > maxUploadBytes)
+          return badRequest("File too large for plan", 403);
+
+        const currentSize = file.size_bytes ?? 0;
+        const nextUsedBytes = user.used_bytes - currentSize + newSizeBytes;
+        const maxBytes = user.quota_gb * GB;
+        if (nextUsedBytes > maxBytes) {
+          return badRequest("Quota exceeded", 403);
+        }
+
+        await env.DB.prepare(
+          "UPDATE files SET status = 'pending_replace' WHERE file_id = ?",
+        )
+          .bind(file.file_id)
+          .run();
+
+        const ttl = Number(env.URL_TTL_SECONDS ?? 300);
+        const uploadUrl = await presignUrl({
+          method: "PUT",
+          bucket: normalizedBucket,
+          objectKey: file.object_key,
+          expiresInSeconds: ttl,
+          headers: {
+            "content-type": body.mimeType,
+            "content-length": String(newSizeBytes),
+          },
+        });
+
+        return json({
+          fileId: file.file_id,
+          objectKey: file.object_key,
+          uploadUrl,
+          replaces: true,
+          expiresAt: new Date(Date.now() + ttl * 1000).toISOString(),
+          requiredHeaders: {
+            "content-type": body.mimeType,
+            "content-length": String(newSizeBytes),
+          },
+        });
+      }
+
+      const replaceCompleteMatch = url.pathname.match(
+        /^\/files\/([^/]+)\/replace\/complete$/,
+      );
+      if (request.method === "POST" && replaceCompleteMatch) {
+        const fileId = replaceCompleteMatch[1];
+        const file = await env.DB.prepare(
+          "SELECT * FROM files WHERE file_id = ? AND client_code = ? AND deleted_at IS NULL",
+        )
+          .bind(fileId, clientCode)
+          .first<FileRow>();
+        if (!file) return badRequest("File not found", 404);
+        if (file.status !== "pending_replace") {
+          return badRequest("File is not waiting for replacement", 409);
+        }
+
+        const headUrl = await presignUrl({
+          method: "HEAD",
+          bucket: normalizedBucket,
+          objectKey: file.object_key,
+          expiresInSeconds: 120,
+        });
+
+        const objectState = await verifyObjectAndReadHeaders(headUrl);
+        const previousSize = file.size_bytes ?? 0;
+        const delta = objectState.sizeBytes - previousSize;
+        const nowIso = new Date().toISOString();
+
+        await env.DB.batch([
+          env.DB.prepare(
+            "UPDATE files SET size_bytes = ?, mime_type = COALESCE(?, mime_type), status = 'active' WHERE file_id = ?",
+          ).bind(objectState.sizeBytes, objectState.contentType, file.file_id),
+          env.DB.prepare(
+            `UPDATE users
+             SET used_bytes = CASE WHEN used_bytes + ? >= 0 THEN used_bytes + ? ELSE 0 END,
+                 uploads_count = uploads_count + 1,
+                 last_activity_at = ?
+             WHERE client_code = ?`,
+          ).bind(delta, delta, nowIso, clientCode),
+        ]);
+
+        const refreshed = await getUser(env.DB, clientCode);
+        return json({
+          fileId: file.file_id,
+          replaced: true,
+          sizeBytes: objectState.sizeBytes,
+          previousSizeBytes: previousSize,
+          deltaBytes: delta,
+          ...usagePayload(refreshed ?? user),
+        });
+      }
+
+      const downloadMatch = url.pathname.match(/^\/files\/([^/]+)\/download$/);
+      if (request.method === "GET" && downloadMatch) {
+        const fileId = downloadMatch[1];
+        const file = await env.DB.prepare(
+          "SELECT * FROM files WHERE file_id = ? AND client_code = ? AND deleted_at IS NULL AND status = 'active'",
+        )
+          .bind(fileId, clientCode)
+          .first<FileRow>();
+        if (!file) return badRequest("File not found", 404);
+
+        const ttl = Number(env.URL_TTL_SECONDS ?? 300);
+        const downloadUrl = await presignUrl({
+          method: "GET",
+          bucket: normalizedBucket,
+          objectKey: file.object_key,
+          expiresInSeconds: ttl,
+        });
+
+        await env.DB.prepare(
+          `UPDATE users
+           SET downloads_count = downloads_count + 1,
+               last_activity_at = ?
+           WHERE client_code = ?`,
+        )
+          .bind(new Date().toISOString(), clientCode)
+          .run();
+
+        return json({
+          downloadUrl,
+          expiresAt: new Date(Date.now() + ttl * 1000).toISOString(),
+        });
+      }
+
+      const deleteMatch = url.pathname.match(/^\/files\/([^/]+)$/);
+      if (request.method === "DELETE" && deleteMatch) {
+        const fileId = deleteMatch[1];
+        const file = await env.DB.prepare(
+          "SELECT * FROM files WHERE file_id = ? AND client_code = ? AND deleted_at IS NULL",
+        )
+          .bind(fileId, clientCode)
+          .first<FileRow>();
+        if (!file) return badRequest("File not found", 404);
+
+        const sizeBytes = file.size_bytes ?? 0;
+        const nowIso = new Date().toISOString();
+
+        await env.DB.batch([
+          env.DB.prepare(
+            "UPDATE files SET deleted_at = ?, status = 'deleted' WHERE file_id = ?",
+          ).bind(nowIso, file.file_id),
+          env.DB.prepare(
+            `UPDATE users
+             SET used_bytes = CASE WHEN used_bytes > ? THEN used_bytes - ? ELSE 0 END,
+                 last_activity_at = ?
+             WHERE client_code = ?`,
+          ).bind(sizeBytes, sizeBytes, nowIso, clientCode),
+        ]);
+
+        const deleteUrl = await presignUrl({
+          method: "DELETE",
+          bucket: normalizedBucket,
+          objectKey: file.object_key,
+          expiresInSeconds: 60,
+        });
+
+        ctx.waitUntil(
+          fetch(deleteUrl, { method: "DELETE" }).catch(() => undefined),
+        );
+
+        const refreshed = await getUser(env.DB, clientCode);
+        return json({ fileId, deleted: true, ...usagePayload(refreshed ?? user) });
+      }
+
+      return badRequest("Not found", 404);
+    } catch (error) {
+      console.error("[vault-api] unhandled request error", {
+        requestId,
+        method: request.method,
+        path: url.pathname,
+        ip,
+        error: serializeError(error),
+      });
+
+      return json(
+        {
+          error: "Internal server error",
+          requestId,
+        },
+        500,
+      );
+    }
+  },
+} satisfies ExportedHandler<Env>;
