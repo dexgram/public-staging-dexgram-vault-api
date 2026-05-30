@@ -2,6 +2,10 @@
 
 Multi-tenant storage API for mobile clients that need secure uploads/downloads to S3-compatible buckets, including Garage, without embedding long-term S3 credentials in apps.
 
+## Long-term direction
+
+Our long-term goal is to interconnect this S3 proxy with https://github.com/SiaFoundation/s3d and the decentralized Sia network. We are waiting for the project to become more reliable before making it part of the production storage path, but we see decentralized storage as the future of the DEX.
+
 ## Features
 
 - **Client-code login** (`POST /auth/login`) backed by Internal API (`/v1/admin/users`) as source of truth.
